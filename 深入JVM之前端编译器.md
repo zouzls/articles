@@ -1,5 +1,5 @@
 ---
-title: 深入JVM之Javac编译器
+title: 深入JVM之前端编译器
 date: 2016-09-06 23:50:44
 tags:
   - JVM
@@ -9,9 +9,10 @@ categories: JVM
 <!--more-->
 ### 概述
 java语言的“编译期”其实是一段“不确定”的操作过程，因为可能是下面三种：
-- 前段编译器
+- 前端编译器
 叫编译器的前端可能更合适，**主要是把*.java文件转变成*.class文件。**主要种类有：Sun的Javac、Eclipse JDT的增量式编译器（ECJ）。
 - JIT编译器
+就是可能指虚拟机的后端运行期编译器（JIT编译器：Just In Time Compiler），**把「字节码」变成「机器码」**，主要有：Hotspot VM的C1、C2编译器。
 就是可能指虚拟机的后端运行期编译器（JIT编译器：Just In Time Compiler），**把「字节码」变成「机器码」**，主要有：Hotspot VM的C1、C2编译器。
 - AOT编译器
 上面两个可能关心更多，这个是指用静态提前编译器（AOT编译器：Ahead Of Time Compiler）直接把*.java变成本地机器码的过程。
@@ -31,9 +32,9 @@ Javac不像是Hotspot虚拟机本身是CPP（少量C）写的，本身是java语
 
 ### Java语法糖
 语法糖虽不能带来实质性的功能的改进，但是它们或能提高效率，或能提升语法严谨性，或能减少编码出错机会。java中常见的语法糖如下：
-- 泛型与泛型擦除
+#### 泛型与泛型擦除
 java的泛型规则只在程序源码中存在，在编译后就已经替换为原来的原生类型（RawType，裸类型），并且在相应的地方插入了强制转换。
-- 自动装箱、拆箱与遍历循环、变长参数
+#### 自动装箱、拆箱与遍历循环、变长参数
 演示代码如下（以下jdk环境1.8）：
 ```java
 public class AutoBoxCompile {
@@ -48,7 +49,7 @@ public class AutoBoxCompile {
     }
 }
 ```
-反编译之后变成：
+用的本地jd-gui.exe工具反编译之后变成：
 ```java
 public class AutoBoxCompile
 {
@@ -63,7 +64,9 @@ public class AutoBoxCompile
   }
 }
 ```
-- 条件编译
+foreach明明是一颗语法糖特性，猜想是工具的问题，找了一个[在线反编译工具](http://www.ludaima.cn/java.html)，得到下列代码，可以发现变长参数、自动装箱和遍历循环的语法糖特性：
+![](http://oaewlsdmg.bkt.clouddn.com/image/jpg/QQ%E5%9B%BE%E7%89%8720160907102754.png)
+#### 条件编译
 类似于下面这段if代码，在编译过程中就会被“运行”。
 ```java
 public class Ifcompiler {
@@ -79,3 +82,8 @@ public class Ifcompiler {
 生成的字节码只包括System.out.println(1111);，将上述编译之后产生的class反编译如下图：
 ![](http://oaewlsdmg.bkt.clouddn.com/image/jpg/QQ%E6%88%AA%E5%9B%BE20160907095715.png)
 只有使用条件为常量的if语句才能有上述效果，否则会被拒绝编译比如while(false){};。
+还有很多其他的语法糖，比如内部类、枚举、断言、switch以及try中关闭资源等等，有时间再去尝试，重要的是明白语法糖是怎么回事。
+
+### 最后
+「之所以把从java文件到字节码文件的编译器叫做前段编译器，是因为它只完成了从程序到抽象语法树或者中间字节码的转变，而在此之后还有一组内置于虚拟机内部的“后端编译器”完成了从字节码到本地机器码的过程，即前面提到的即时编译器或JIT编译器，这个编译器的编译速度及结果的优劣，是衡量虚拟机性能的很重要的指标。」
+JVM还有很多的东西没有去挖掘，希望这是个开端，能不断的去探索java虚拟机更深处的东西。
