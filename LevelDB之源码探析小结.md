@@ -207,13 +207,215 @@ void MemTable::Add(SequenceNumber s, ValueType type,
 其他详情参考：[MemTable](http://mingxinglai.com/cn/2013/01/leveldb-memtable/)
 
 #### sstable
-1. 逻辑结构
-如果你想看原汁原味的作者写的文档，可以打开/doc/table_format.txt,作者在该文档中大致描述了sstable的轮廓，不过看完总是还有些许地方比较疑惑，比如block data中的restartpoint（重启点）概念，从整体来看，下面这篇参考博文对sstable的解释更清楚易懂：
+##### 逻辑结构
+如果你想看原汁原味的作者写的文档，可以打开/doc/table_format.txt,作者在该文档中大致描述了sstable的轮廓，不过看完总是还有些许地方比较疑惑描述的不是那么清晰，比如block data中的restartpoint（重启点）概念等等，从找的资料来看，下面这篇参考博文对sstable的逻辑结构解释比较清楚易懂：
 
 >也许你会以为在划分好block的数据存储区域以后那么就是一个一个的KV对（如图中的Record）了，但是其实不是，leveldb为了降低数据的存储量和快速的查找引入了一个重启点（restartpoint）的概念。出自参考1：[SSTable之逻辑结构](http://www.cnblogs.com/KevinT/p/3815764.html)
 
 参考2：[SSTable的文件组织](http://blog.csdn.net/sparkliang/article/details/8635821)
-2. 
+##### table_builder解析
+知道了sstable文件的逻辑结构，才能更好的理解sstable的创建过程，在源码中主要是由table_builder.cc这个文件来帮助完成这些功能的（注意table_builder并不是sstable文件的格式，它只是完成了文件内容的组装和写入）。刚开始看可能会云里雾里，但是在阅读代码之前脑子中尤其应该有data block、index block这些逻辑结构的印象，这是理解代码的基本。
+1. table_builder.h中的结构体和方法
+```cpp
+ private:
+  bool ok() const { return status().ok(); }
+  //写文件之前将数据序列化为slice
+  void WriteBlock(BlockBuilder* block, BlockHandle* handle);
+  //将内容写进文件中
+  void WriteRawBlock(const Slice& data, CompressionType, BlockHandle* handle);
 
+  struct Rep;//其实是封装了table_builder的成员变量，隐藏细节
+  Rep* rep_;
+```
+下面会进入table_builder.cc文件中。
+2. 结构体Rep的成员变量：
+```cpp
+  Options options;
+  Options index_block_options;
+
+  WritableFile* file;       //!!!sstable文件!!!
+
+  uint64_t offset;          // data block在sstable文件中的偏移，初始0  
+  Status status;
+  
+  BlockBuilder data_block;  //!!!当前操作的data block!!!  
+  BlockBuilder index_block; // sstable的index block
+  
+  std::string last_key;     //当前data block最后的一条k/v对的key  
+  int64_t num_entries;      //当前k/v个数，初始0,add方法中可知  
+  bool closed;              //调用了Finish() or Abandon()，初始false
+  FilterBlockBuilder* filter_block;//根据这个块可以快速定位key在不在
+  bool pending_index_entry;
+  BlockHandle pending_handle;//属于index block中的每个k/v中的v，指向data block，可以从字面理解
+
+  std::string compressed_output;//压缩后的data block，临时存储，写入后即被清空 
+```
+3. Add方法添加每条kv
+该方法的主要作用就是给当前的data block添加k/v对，这中间还要完成一系列其他的操作，比如：在index block中添加data block的索引键值对（key<->blockhandle）、在filter block中添加key。
+```cpp
+void TableBuilder::Add(const Slice& key, const Slice& value) {
+  Rep* r = rep_;
+  assert(!r->closed);
+  if (!ok()) return;
+  if (r->num_entries > 0) {
+    assert(r->options.comparator->Compare(key, Slice(r->last_key)) > 0);
+  }
+  //r->pending_index_entry标记当前block是否为空，为null才允许进入
+  if (r->pending_index_entry) {
+    assert(r->data_block.empty());
+    r->options.comparator->FindShortestSeparator(&r->last_key, key);
+    std::string handle_encoding;
+    r->pending_handle.EncodeTo(&handle_encoding);
+    //所以只能每一个新的data block，在index block中添加一条索引
+    r->index_block.Add(r->last_key, Slice(handle_encoding));
+    r->pending_index_entry = false;
+  }
+  //filter_block不空的时候，添加key
+  if (r->filter_block != NULL) {
+    r->filter_block->AddKey(key);
+  }
+
+  r->last_key.assign(key.data(), key.size());
+  //总记录数自增
+  r->num_entries++;
+  //当前data block添加记录
+  r->data_block.Add(key, value);
+
+  const size_t estimated_block_size = r->data_block.CurrentSizeEstimate();
+  //当前data block大小达到一定阀值，将缓存kv写入文件。
+  if (estimated_block_size >= r->options.block_size) {
+    Flush();
+  }
+}
+void TableBuilder::Flush() {
+  Rep* r = rep_;
+  assert(!r->closed);
+  if (!ok()) return;
+  if (r->data_block.empty()) return;
+  assert(!r->pending_index_entry);
+  /////////////////////////////////////////////
+  WriteBlock(&r->data_block, &r->pending_handle);
+  /////////////////////////////////////////////
+  ...
+}
+```
+4. WriteBlock方法完成写block的准备工作
+这里的block不仅仅是data block，而是所有的block，从最下面的Finish方法就可以看出。包括data block、filter block在内的所有block都会通过该方法完成block写入文件。
+```cpp
+
+void TableBuilder::WriteBlock(BlockBuilder* block, BlockHandle* handle) {
+  // File format contains a sequence of blocks where each block has:
+  //    block_data: uint8[n]
+  //    type: uint8
+  //    crc: uint32
+  assert(ok());
+  Rep* r = rep_;
+  Slice raw = block->Finish();//获得data block的序列化字符串，注意这里不要看错是Finish，不是Flush
+  //完成压缩方式的选择
+  Slice block_contents;
+  CompressionType type = r->options.compression;
+  switch (type) {
+    case kNoCompression://不压缩
+      block_contents = raw;
+      break;
+    case kSnappyCompression: {//压缩
+      ...
+      break;
+    }
+  }
+  ///////////////开始真正写文件方法///////////////
+  WriteRawBlock(block_contents, type, handle);
+  //写完之后的一些清理工作
+  r->compressed_output.clear();
+  block->Reset();
+}
+```
+5. WriteRawBlock真正写入block数据到文件
+
+```cpp
+void TableBuilder::WriteRawBlock(const Slice& block_contents,
+                                 CompressionType type,
+                                 BlockHandle* handle) {
+  Rep* r = rep_;
+  handle->set_offset(r->offset);//在handle中设置当前block在文件中的偏移
+  handle->set_size(block_contents.size());//设置block大小
+  r->status = r->file->Append(block_contents);//将当前block内容写入file中
+  if (r->status.ok()) {// 写入1byte的type和4bytes的crc32
+    char trailer[kBlockTrailerSize];
+    trailer[0] = type;
+    uint32_t crc = crc32c::Value(block_contents.data(), block_contents.size());
+    crc = crc32c::Extend(crc, trailer, 1);  
+    EncodeFixed32(trailer+1, crc32c::Mask(crc));
+    r->status = r->file->Append(Slice(trailer, kBlockTrailerSize));
+    if (r->status.ok()) {
+      r->offset += block_contents.size() + kBlockTrailerSize;// 写入成功更新offset-下一个data block的写入偏移
+    }
+  }
+}
+```
+6. Finish()方法完成添加完所有KV之后的工作
+基本就是按照sstable文件格式的顺序来完成的，Write filter block、Write metaindex block、Write index block、 Write footer。
+```cpp
+Status TableBuilder::Finish() {
+  Rep* r = rep_;
+  Flush();
+  assert(!r->closed);
+  r->closed = true;
+
+  BlockHandle filter_block_handle, metaindex_block_handle, index_block_handle;
+
+  // Write filter block
+  if (ok() && r->filter_block != NULL) {
+    WriteRawBlock(r->filter_block->Finish(), kNoCompression,
+                  &filter_block_handle);
+  }
+
+  // Write metaindex block
+  if (ok()) {
+    BlockBuilder meta_index_block(&r->options);
+    if (r->filter_block != NULL) {
+      // Add mapping from "filter.Name" to location of filter data
+      std::string key = "filter.";
+      key.append(r->options.filter_policy->Name());
+      std::string handle_encoding;
+      filter_block_handle.EncodeTo(&handle_encoding);
+      meta_index_block.Add(key, handle_encoding);
+    }
+
+    // TODO(postrelease): Add stats and other meta blocks
+    WriteBlock(&meta_index_block, &metaindex_block_handle);
+  }
+
+  // Write index block
+  if (ok()) {
+    if (r->pending_index_entry) {
+      r->options.comparator->FindShortSuccessor(&r->last_key);
+      std::string handle_encoding;
+      r->pending_handle.EncodeTo(&handle_encoding);
+      r->index_block.Add(r->last_key, Slice(handle_encoding));
+      r->pending_index_entry = false;
+    }
+    WriteBlock(&r->index_block, &index_block_handle);
+  }
+
+  // Write footer
+  if (ok()) {
+    Footer footer;
+    footer.set_metaindex_handle(metaindex_block_handle);
+    footer.set_index_handle(index_block_handle);
+    std::string footer_encoding;
+    footer.EncodeTo(&footer_encoding);
+    r->status = r->file->Append(footer_encoding);
+    if (r->status.ok()) {
+      r->offset += footer_encoding.size();
+    }
+  }
+  return r->status;
+}
+
+```
+
+到这基本sstable文件的创建过程就结束了，一刚开始看基本是懵懵懂懂，到最后仔细看完，发现是大快人心啊，逻辑顺畅太棒了！下面是参考文章，不过感觉排版有点乱，看起来有点累。
+参考：[创建sstable文件](http://blog.csdn.net/sparkliang/article/details/8653370)
 
 
